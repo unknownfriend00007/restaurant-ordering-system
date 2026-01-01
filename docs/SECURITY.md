@@ -1,423 +1,398 @@
-# Security Implementation Guide
+# 🔒 Security Implementation Guide
 
-This document explains the security measures implemented in the Restaurant Ordering System.
+This document details all security measures implemented in the restaurant ordering system.
 
-## 🔐 Architecture Overview
+## Table of Contents
 
-```
-Client (Browser)
-    |
-    | 1. Create order request
-    |
-    v
-Backend API (/api/create-order)
-    |
-    | 2. Validate & verify prices from DB
-    | 3. Create Razorpay order
-    |
-    v
-Client receives order_id
-    |
-    | 4. Show Razorpay checkout
-    |
-    v
-Razorpay Payment Gateway
-    |
-    | 5. Payment completed
-    |
-    v
-Backend API (/api/verify-payment)
-    |
-    | 6. Verify HMAC signature
-    | 7. Update database
-    |
-    v
-Razorpay Webhook (/api/webhook)
-    |
-    | 8. Verify webhook signature
-    | 9. Final status update
-```
+1. [Payment Security](#payment-security)
+2. [Database Security](#database-security)
+3. [API Security](#api-security)
+4. [Input Validation](#input-validation)
+5. [Environment Variables](#environment-variables)
+6. [Security Checklist](#security-checklist)
 
-## 1. Server-Side Price Verification
+---
 
-### Problem
-Clients can manipulate JavaScript and send fake prices.
+## Payment Security
 
-### Solution
-Never trust client-submitted prices. Always recalculate on server.
+### 1. Server-Side Price Verification
 
+**Problem:** Malicious users can modify client-side prices to pay less.
+
+**Solution:**
 ```typescript
-// ❌ WRONG - Trusting client price
-const amount = req.body.total; // Client can send any value!
+// Menu prices stored on backend as SOURCE OF TRUTH
+const MENU_PRICES: Record<string, number> = {
+  'biryani': 25000, // ₹250.00 in paise
+  'butter-chicken': 35000,
+};
 
-// ✅ CORRECT - Recalculate from database
-const menuItems = await fetchMenuFromDB();
-const calculatedTotal = cart.items.reduce((sum, item) => {
-  const menuItem = menuItems.find(m => m.id === item.id);
-  return sum + (menuItem.price * item.quantity);
-}, 0);
+// Backend recalculates total from scratch
+let totalAmount = 0;
+for (const item of items) {
+  const correctPrice = MENU_PRICES[item.id]; // Never trust client price
+  totalAmount += correctPrice * item.quantity;
+}
 ```
 
-### Implementation
-1. Menu items stored in `menu_items` table with prices
-2. Backend fetches current prices from database
-3. Backend recalculates total independently
-4. Compare calculated vs submitted (reject if mismatch)
-5. Use calculated amount for Razorpay order
+**Implementation:** `api/create-order.ts`
 
-## 2. Cryptographic Payment Verification
+### 2. Cryptographic Signature Verification
 
-### Problem
-Attackers can fake payment success by calling verify endpoint directly.
+**Problem:** Attackers might forge payment success responses.
 
-### Solution
-Verify HMAC-SHA256 signature provided by Razorpay.
-
+**Solution:**
 ```typescript
-import crypto from 'crypto';
-
-// Construct message exactly as Razorpay does
-const message = razorpay_order_id + "|" + razorpay_payment_id;
-
-// Calculate HMAC using your secret key
+// HMAC-SHA256 signature verification
+const body = razorpay_order_id + '|' + razorpay_payment_id;
 const expectedSignature = crypto
   .createHmac('sha256', RAZORPAY_KEY_SECRET)
-  .update(message)
+  .update(body)
   .digest('hex');
 
-// ⚠️ Use timing-safe comparison
+// Timing-safe comparison prevents timing attacks
 const isValid = crypto.timingSafeEqual(
   Buffer.from(expectedSignature),
   Buffer.from(razorpay_signature)
 );
 ```
 
-### Why timing-safe comparison?
-Prevents timing attacks where attackers measure response time to guess signature.
+**Why Timing-Safe?** Regular `===` comparison can leak information through timing differences, allowing attackers to guess signatures character by character.
 
-## 3. Webhook Security
+**Implementation:** `api/verify-payment.ts`
 
-### Problem
-Anyone can POST to your webhook endpoint with fake data.
+### 3. Webhook Signature Verification
 
-### Solution
-Verify webhook signature before processing.
+**Problem:** Attackers might send fake webhook events.
 
+**Solution:**
 ```typescript
-// Get raw body (required for signature verification)
+// Get raw body (not parsed JSON)
 const rawBody = await getRawBody(req);
-
-// Get signature from header
 const signature = req.headers['x-razorpay-signature'];
 
-// Calculate expected signature
+// Verify signature using webhook secret
 const expectedSignature = crypto
   .createHmac('sha256', RAZORPAY_WEBHOOK_SECRET)
-  .update(rawBody)
+  .update(rawBody) // Must be raw string, not parsed object
   .digest('hex');
-
-// Verify
-if (!crypto.timingSafeEqual(
-  Buffer.from(expectedSignature),
-  Buffer.from(signature)
-)) {
-  throw new Error('Invalid signature');
-}
 ```
 
-### Idempotency
-Same payment might trigger webhook multiple times. Use idempotent processing:
+**Critical:** Must use raw body before JSON parsing. Vercel automatically parses body, so we disable it:
 
 ```typescript
-// Check if payment already processed
-const existingOrder = await db.findOne({
-  razorpay_payment_id: payment.id
-});
-
-if (existingOrder.payment_status === 'paid') {
-  return { status: 'already_processed' };
-}
-
-// Update only if not already paid
-if (event.event === 'payment.captured' && 
-    existingOrder.payment_status !== 'paid') {
-  await db.update({
-    payment_status: 'paid',
-    paid_at: new Date()
-  });
-}
+export const config = {
+  api: { bodyParser: false }
+};
 ```
 
-## 4. Environment Variables
+**Implementation:** `api/webhook.ts`
 
-### Public vs Secret Keys
+### 4. Idempotent Payment Processing
 
-**Public Keys** (VITE_ prefix):
-- Bundled into frontend JavaScript
-- Visible to anyone
-- Safe: `VITE_RAZORPAY_KEY_ID`, `VITE_SUPABASE_URL`, `VITE_SUPABASE_ANON_KEY`
+**Problem:** Network issues might cause duplicate webhook delivery.
 
-**Secret Keys** (No prefix):
-- Only accessible to backend
-- Never sent to client
-- Critical: `RAZORPAY_KEY_SECRET`, `RAZORPAY_WEBHOOK_SECRET`, `SUPABASE_SERVICE_KEY`
+**Solution:**
+```typescript
+// Check if already processed
+if (order.payment_status === 'paid') {
+  console.log('Payment already processed');
+  return res.status(200).json({ verified: true });
+}
 
-### Vercel Configuration
-```env
-# Frontend + Backend (not sensitive)
-VITE_RAZORPAY_KEY_ID=rzp_test_xxx
-VITE_SUPABASE_URL=https://xxx.supabase.co
-VITE_SUPABASE_ANON_KEY=eyJ...
-
-# Backend ONLY (mark as Secret in Vercel)
-RAZORPAY_KEY_SECRET=secret_xxx        # ⚠️ Secret
-RAZORPAY_WEBHOOK_SECRET=whsec_xxx     # ⚠️ Secret
-SUPABASE_SERVICE_KEY=eyJ...           # ⚠️ Secret
+// Process only once
+await supabase.from('orders').update({ payment_status: 'paid' });
 ```
 
-## 5. Input Validation
+**Implementation:** Both `verify-payment.ts` and `webhook.ts`
 
-### Never trust user input
+---
+
+## Database Security
+
+### 1. Row Level Security (RLS)
+
+**Problem:** Without RLS, anyone with database credentials can access all data.
+
+**Solution:**
+```sql
+-- Enable RLS on orders table
+ALTER TABLE orders ENABLE ROW LEVEL SECURITY;
+
+-- Customers can only view their own orders
+CREATE POLICY "Customers can view own orders"
+  ON orders FOR SELECT
+  USING (customer_phone = current_setting('app.user_phone', true));
+
+-- Only backend (service role) can insert/update
+CREATE POLICY "Service role can insert orders"
+  ON orders FOR INSERT
+  WITH CHECK (auth.role() = 'service_role');
+
+CREATE POLICY "Service role can update orders"
+  ON orders FOR UPDATE
+  USING (auth.role() = 'service_role');
+
+-- No deletion allowed
+-- (Use soft delete by updating order_status to 'cancelled')
+```
+
+**Implementation:** `database/schema.sql`
+
+### 2. Parameterized Queries
+
+**Problem:** SQL injection attacks.
+
+**Solution:** Supabase JS client automatically uses parameterized queries:
 
 ```typescript
-// Validation functions
-function validatePhone(phone: string): boolean {
-  // Indian mobile: 10 digits, starts with 6-9
-  return /^[6-9][0-9]{9}$/.test(phone);
-}
-
-function validateName(name: string): boolean {
-  // 2-50 characters, letters and spaces only
-  return /^[a-zA-Z\s]{2,50}$/.test(name.trim());
-}
-
-function validateAddress(address: string): boolean {
-  const trimmed = address.trim();
-  return trimmed.length >= 10 && trimmed.length <= 200;
-}
-
-function validateQuantity(qty: number): boolean {
-  return Number.isInteger(qty) && qty >= 1 && qty <= 10;
-}
-
-function validateAmount(amount: number): boolean {
-  return amount >= 50 && amount <= 10000;
-}
-
-// Apply before processing
-if (!validatePhone(customerPhone)) {
-  throw new Error('Invalid phone number');
-}
-```
-
-### SQL Injection Prevention
-Use parameterized queries (Supabase client handles this):
-
-```typescript
-// ✅ Safe - parameterized
-const { data } = await supabase
+// ✅ SAFE - Parameterized
+await supabase
   .from('orders')
   .select('*')
-  .eq('customer_phone', phone);
+  .eq('customer_phone', phone); // Safely escaped
 
-// ❌ Dangerous - string concatenation
-const query = `SELECT * FROM orders WHERE phone='${phone}'`;
+// ❌ DANGEROUS - Never do this
+await supabase.rpc('raw_query', {
+  query: `SELECT * FROM orders WHERE phone = '${phone}'`
+});
 ```
 
-## 6. Database Security (RLS)
+### 3. Service Role vs Anon Key
 
-### Row Level Security Policies
+**Environment Variables:**
 
-```sql
--- Customers can only see their own orders
-CREATE POLICY "Customers can view own orders"
-    ON orders FOR SELECT
-    USING (customer_phone = current_setting('app.customer_phone', true));
+- `SUPABASE_ANON_KEY` - Limited access, respects RLS (frontend)
+- `SUPABASE_SERVICE_KEY` - Full access, bypasses RLS (backend only)
 
--- Only service role can create orders
-CREATE POLICY "Service role can insert orders"
-    ON orders FOR INSERT
-    WITH CHECK (auth.role() = 'service_role');
-
--- No one can delete orders
-CREATE POLICY "No one can delete orders"
-    ON orders FOR DELETE
-    USING (false);
-```
-
-### Using Service Role in Backend
+**Usage:**
 
 ```typescript
-// Frontend - uses anon key with RLS
-const supabase = createClient(
-  process.env.VITE_SUPABASE_URL,
-  process.env.VITE_SUPABASE_ANON_KEY
-);
+// Frontend - Uses anon key (RLS enforced)
+const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
-// Backend - uses service key (bypasses RLS)
-const supabaseAdmin = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_KEY,
-  {
-    auth: { persistSession: false }
-  }
-);
+// Backend - Uses service role (full access)
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 ```
 
-## 7. Error Handling
+---
 
-### Never expose internal details to client
+## API Security
+
+### 1. Input Validation
+
+All API endpoints validate inputs before processing:
 
 ```typescript
-// ❌ Bad - exposes internals
-catch (error) {
-  res.json({ error: error.message }); // Might reveal DB structure
+// Customer name: 2-50 chars, letters only
+if (!/^[a-zA-Z\s]+$/.test(customerName)) {
+  return res.status(400).json({ error: 'Invalid name' });
 }
 
-// ✅ Good - generic message + server logging
-catch (error) {
-  console.error('[CREATE_ORDER_ERROR]', error); // Log server-side
-  res.status(500).json({ 
-    error: 'Failed to create order. Please try again.' 
-  });
+// Phone: Indian format (10 digits, starts with 6-9)
+if (!/^[6-9]\d{9}$/.test(customerPhone)) {
+  return res.status(400).json({ error: 'Invalid phone' });
+}
+
+// Quantity: 1-10 per item
+if (quantity < 1 || quantity > 10) {
+  return res.status(400).json({ error: 'Invalid quantity' });
+}
+
+// Amount: ₹50 - ₹10,000
+if (totalAmount < 5000 || totalAmount > 1000000) {
+  return res.status(400).json({ error: 'Invalid amount' });
 }
 ```
 
-## 8. PCI-DSS Compliance
+### 2. Error Handling
 
-### What NOT to store:
-- ❌ Full credit card numbers
-- ❌ CVV/CVC codes
-- ❌ PIN numbers
-- ❌ Magnetic stripe data
+**Never expose internal errors to client:**
 
-### What you CAN store:
-- ✅ Razorpay Order ID
-- ✅ Razorpay Payment ID
-- ✅ Payment status
-- ✅ Last 4 digits (if provided by Razorpay)
-- ✅ Card brand (Visa/Mastercard)
+```typescript
+try {
+  // ... operation
+} catch (error) {
+  // ✅ Log detailed error server-side
+  console.error('Detailed error:', error);
+  
+  // ✅ Return generic message to client
+  return res.status(500).json({ error: 'Internal server error' });
+  
+  // ❌ Never do this:
+  // return res.status(500).json({ error: error.message });
+}
+```
 
-### Implementation
-All sensitive card data stays with Razorpay (PCI Level 1 certified). We only store payment references.
+### 3. CORS Configuration
 
-## 9. HTTPS/TLS
+Configure allowed origins in production:
 
-### Production Requirements
-- ✅ HTTPS only (automatic with Vercel)
-- ✅ TLS 1.2 or higher
-- ✅ Valid SSL certificate
-- ✅ Redirect HTTP to HTTPS
-
-### Security Headers
-```json
+```typescript
 // vercel.json
 {
   "headers": [
     {
-      "source": "/(.*)",
+      "source": "/api/(.*)",
       "headers": [
-        { "key": "X-Content-Type-Options", "value": "nosniff" },
-        { "key": "X-Frame-Options", "value": "DENY" },
-        { "key": "X-XSS-Protection", "value": "1; mode=block" },
-        { "key": "Referrer-Policy", "value": "strict-origin-when-cross-origin" }
+        { "key": "Access-Control-Allow-Origin", "value": "https://yoursite.vercel.app" },
+        { "key": "Access-Control-Allow-Methods", "value": "POST, OPTIONS" }
       ]
     }
   ]
 }
 ```
 
-## 10. Rate Limiting (Future)
+---
 
-For production, implement rate limiting:
+## Environment Variables
 
-```typescript
-// Limit: 10 order creation attempts per IP per hour
-// Limit: 20 payment verifications per IP per hour
-// Use Upstash Redis or Vercel Edge Config
+### Public vs Secret Keys
+
+| Variable | Frontend | Backend | Secret? |
+|----------|----------|---------|----------|
+| `VITE_RAZORPAY_KEY_ID` | ✅ | ✅ | ❌ Public |
+| `RAZORPAY_KEY_SECRET` | ❌ | ✅ | ✅ **SECRET** |
+| `RAZORPAY_WEBHOOK_SECRET` | ❌ | ✅ | ✅ **SECRET** |
+| `VITE_SUPABASE_URL` | ✅ | ✅ | ❌ Public |
+| `VITE_SUPABASE_ANON_KEY` | ✅ | ✅ | ❌ Public (RLS protected) |
+| `SUPABASE_SERVICE_KEY` | ❌ | ✅ | ✅ **SECRET** |
+
+### Never Commit Secrets
+
+```bash
+# .gitignore
+.env
+.env.local
+.env.*.local
 ```
+
+### Vercel Environment Variables
+
+1. Go to Project Settings → Environment Variables
+2. Add each variable with appropriate scope:
+   - Production
+   - Preview
+   - Development
+3. Redeploy after adding variables
+
+---
 
 ## Security Checklist
 
-Before production:
+### Before Production
 
-- [ ] All secret keys stored in environment variables
-- [ ] No secrets in Git history
-- [ ] Server-side price verification working
-- [ ] Payment signature verification working
-- [ ] Webhook signature verification working
-- [ ] Input validation on all fields
-- [ ] RLS policies enabled and tested
-- [ ] HTTPS enforced
-- [ ] Security headers configured
-- [ ] Error messages don't leak internals
-- [ ] No card data stored in database
-- [ ] Idempotent webhook processing
-- [ ] Timing-safe comparisons for signatures
-- [ ] Service role key secured
-- [ ] Regular dependency updates
-- [ ] Security audit completed
+- [ ] All secrets in Vercel environment variables (not in code)
+- [ ] `.env` added to `.gitignore`
+- [ ] RLS enabled on all database tables
+- [ ] RLS policies tested with different user scenarios
+- [ ] Payment signature verification tested
+- [ ] Webhook signature verification tested
+- [ ] Input validation on all API endpoints
+- [ ] Error messages don't expose sensitive data
+- [ ] CORS configured for production domain only
+- [ ] HTTPS enforced (automatic with Vercel)
+- [ ] Rate limiting configured (Vercel automatic)
 
-## Testing Security
+### Testing
 
-### Price Manipulation Test
-1. Open browser DevTools
-2. Modify cart prices in localStorage
-3. Try to checkout
-4. Backend should reject or recalculate
+- [ ] Test with Razorpay test mode keys
+- [ ] Test with invalid signatures (should fail)
+- [ ] Test with manipulated prices (should use server prices)
+- [ ] Test duplicate webhook delivery (should be idempotent)
+- [ ] Test RLS with different phone numbers
+- [ ] Test input validation with malicious inputs
 
-### Fake Payment Test
-1. Try calling `/api/verify-payment` with fake signature
-2. Should return 400/401 error
-3. Database should not update
+### Monitoring
 
-### Webhook Forgery Test
-1. Try POSTing to `/api/webhook` without signature
-2. Should return 401
-3. Try with wrong signature
-4. Should return 401
+- [ ] Set up error logging (Sentry, LogRocket, etc.)
+- [ ] Monitor failed payment attempts
+- [ ] Monitor invalid signature attempts
+- [ ] Set up alerts for unusual activity
 
-## Incident Response
+---
 
-If security breach detected:
+## PCI-DSS Compliance
 
-1. **Immediate:**
-   - Rotate all API keys
-   - Disable webhook temporarily
-   - Check database for unauthorized changes
+### What We Don't Store (PCI Compliant)
 
-2. **Investigation:**
-   - Review server logs
-   - Check Razorpay dashboard for anomalies
-   - Identify breach source
+✅ **Never stored on our servers:**
+- Credit card numbers
+- CVV codes
+- Expiry dates
+- Card holder names
+- Any sensitive card data
 
-3. **Recovery:**
-   - Fix vulnerability
-   - Deploy patch
-   - Notify affected customers (if applicable)
-   - Document incident
+### What We Do Store
 
-## Resources
+✅ **Safe to store:**
+- Razorpay Order IDs
+- Razorpay Payment IDs
+- Customer contact information
+- Order details and amounts
+- Payment status
 
-- [OWASP Top 10](https://owasp.org/www-project-top-ten/)
+**Why it's safe:** Razorpay is PCI Level 1 certified. All card data is handled by Razorpay, never touching our servers.
+
+---
+
+## Common Security Mistakes
+
+### ❌ DON'T DO THIS
+
+```typescript
+// 1. Trusting client prices
+const total = req.body.total; // ❌ Client can modify this
+
+// 2. Exposing secrets in frontend
+const secret = process.env.RAZORPAY_KEY_SECRET; // ❌ Leaked to client
+
+// 3. Not verifying signatures
+if (req.body.success) { // ❌ Anyone can send this
+  markOrderAsPaid();
+}
+
+// 4. Using == for signature comparison
+if (expectedSig == providedSig) { // ❌ Timing attack vulnerable
+  // ...
+}
+```
+
+### ✅ DO THIS INSTEAD
+
+```typescript
+// 1. Calculate prices on server
+const total = items.reduce((sum, item) => 
+  sum + MENU_PRICES[item.id] * item.quantity, 0
+);
+
+// 2. Use separate keys for frontend/backend
+const keyId = process.env.VITE_RAZORPAY_KEY_ID; // Public
+const secret = process.env.RAZORPAY_KEY_SECRET; // Backend only
+
+// 3. Always verify signatures
+const isValid = verifySignature(order_id, payment_id, signature);
+if (isValid) { markOrderAsPaid(); }
+
+// 4. Use timing-safe comparison
+if (crypto.timingSafeEqual(Buffer.from(expectedSig), Buffer.from(providedSig))) {
+  // ...
+}
+```
+
+---
+
+## Additional Resources
+
 - [Razorpay Security Best Practices](https://razorpay.com/docs/payments/security/)
-- [Supabase Security](https://supabase.com/docs/guides/auth/row-level-security)
-- [PCI-DSS Compliance](https://www.pcisecuritystandards.org/)
+- [Supabase RLS Guide](https://supabase.com/docs/guides/auth/row-level-security)
+- [OWASP Top 10](https://owasp.org/www-project-top-ten/)
+- [PCI-DSS Requirements](https://www.pcisecuritystandards.org/)
 
-## Regular Security Maintenance
+---
 
-**Weekly:**
-- Review error logs
-- Check for failed payment attempts
-- Monitor webhook failures
+## Support
 
-**Monthly:**
-- Update dependencies (`pnpm update`)
-- Review RLS policies
-- Audit new orders for anomalies
+For security concerns, please report to: your-email@example.com
 
-**Quarterly:**
-- Full security audit
-- Penetration testing
-- Update documentation
-- Review and rotate API keys
+**Do not** open public GitHub issues for security vulnerabilities.
